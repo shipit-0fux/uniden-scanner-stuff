@@ -29,9 +29,9 @@ type TUI struct {
 	infoPanel *tview.TextView
 	pages     *tview.Pages
 
-	psiMu      sync.Mutex
-	psiCancel  context.CancelFunc
-	psiActive  atomic.Bool
+	psiMu       sync.Mutex
+	psiCancel   context.CancelFunc
+	psiActive   atomic.Bool
 	psiInterval atomic.Int32
 }
 
@@ -97,7 +97,7 @@ func (ui *TUI) build(functions []Function) {
 	mainFlex := tview.NewFlex().
 		AddItem(leftPanel, 36, 0, false).
 		AddItem(centerPanel, 0, 1, true).
-		AddItem(ui.infoPanel, 42, 0, false)
+		AddItem(ui.infoPanel, 83, 0, false)
 
 	ui.pages = tview.NewPages().AddPage("main", mainFlex, true, true)
 	ui.layout = ui.pages
