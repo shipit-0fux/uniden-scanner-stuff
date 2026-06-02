@@ -40,12 +40,3 @@ func main() {
 		log.Fatal(err)
 	}
 }
-
-type RawCommand struct {
-	cmd string
-}
-
-func (c RawCommand) Send() string { return c.cmd }
-func (c RawCommand) Parse(response string) (string, error) {
-	return response, nil
-}

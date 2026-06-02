@@ -23,6 +23,17 @@ func Execute[R any](s *Scanner, cmd Command[R]) (R, error) {
 
 func zero[R any]() R { var z R; return z }
 
+func ExecuteAll[R any](s *Scanner, cmd Command[R]) (R, error) {
+	if err := s.Send(cmd.Send()); err != nil {
+		return zero[R](), err
+	}
+	data, err := s.ReadAll()
+	if err != nil {
+		return zero[R](), err
+	}
+	return cmd.Parse(data)
+}
+
 type MDLResponse struct{ Model string }
 
 type MDLCommand struct{}
