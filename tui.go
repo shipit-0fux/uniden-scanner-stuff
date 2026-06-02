@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/gdamore/tcell/v2"
@@ -18,12 +21,18 @@ type TUI struct {
 	mu       sync.Mutex
 	running  atomic.Bool
 
-	layout   tview.Primitive
-	console  *tview.TextView
-	input    *tview.InputField
-	cmdList  *tview.List
-	funcList *tview.List
-	pages    *tview.Pages
+	layout    tview.Primitive
+	console   *tview.TextView
+	input     *tview.InputField
+	cmdList   *tview.List
+	funcList  *tview.List
+	infoPanel *tview.TextView
+	pages     *tview.Pages
+
+	psiMu      sync.Mutex
+	psiCancel  context.CancelFunc
+	psiActive  atomic.Bool
+	psiInterval atomic.Int32
 }
 
 func newTUI(app *tview.Application, scanner *Scanner, functions []Function, funcFile string) *TUI {
@@ -70,17 +79,25 @@ func (ui *TUI) build(functions []Function) {
 	ui.funcList.SetSelectedStyle(tcell.StyleDefault.Background(tcell.ColorDarkBlue).Foreground(tcell.ColorWhite))
 	ui.populateFuncList(functions)
 
+	ui.infoPanel = tview.NewTextView().
+		SetDynamicColors(true).
+		SetScrollable(true).
+		SetWordWrap(false)
+	ui.infoPanel.SetBorder(true).SetTitle(" Scanner Info ")
+	fmt.Fprint(ui.infoPanel, "[::d]Run GSI to populate[-]")
+
 	leftPanel := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(ui.cmdList, 0, 1, false).
 		AddItem(ui.funcList, 0, 1, false)
 
-	rightPanel := tview.NewFlex().SetDirection(tview.FlexRow).
+	centerPanel := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(ui.console, 0, 1, false).
 		AddItem(ui.input, 3, 0, true)
 
 	mainFlex := tview.NewFlex().
 		AddItem(leftPanel, 36, 0, false).
-		AddItem(rightPanel, 0, 1, true)
+		AddItem(centerPanel, 0, 1, true).
+		AddItem(ui.infoPanel, 42, 0, false)
 
 	ui.pages = tview.NewPages().AddPage("main", mainFlex, true, true)
 	ui.layout = ui.pages
@@ -170,6 +187,64 @@ func (ui *TUI) populateCmdList() {
 					return
 				}
 				go ui.triggerKEYCommand()
+			},
+		},
+		{
+			name: "CopyConsole",
+			desc: "Copy console text to clipboard",
+			run: func() {
+				text := ui.console.GetText(true)
+				cmd := exec.Command("pbcopy")
+				cmd.Stdin = strings.NewReader(text)
+				if err := cmd.Run(); err != nil {
+					ui.logf("[red]Copy failed: %v[-]\n", err)
+					return
+				}
+				ui.logf("[green]Console copied to clipboard[-]\n")
+			},
+		},
+		{
+			name: "GSICommand",
+			desc: "GSI — get scanner info (updates right panel)",
+			run: func() {
+				if ui.running.Load() {
+					return
+				}
+				go func() {
+					ui.setBlocked(true)
+					defer ui.setBlocked(false)
+					ui.mu.Lock()
+					defer ui.mu.Unlock()
+					ui.logf("[yellow]> GSI[-]\n")
+					info, err := ExecuteAll(ui.scanner, GSICommand{})
+					if err != nil {
+						ui.logf("[red]Error: %v[-]\n", err)
+						return
+					}
+					ui.logf("[green]GSI OK[-]\n")
+					ui.app.QueueUpdateDraw(func() {
+						ui.infoPanel.Clear()
+						fmt.Fprint(ui.infoPanel, renderGSIPanel(info))
+						ui.infoPanel.ScrollToBeginning()
+					})
+				}()
+			},
+		},
+		{
+			name: "PSI Start",
+			desc: "PSI,<ms> — push scanner info periodically",
+			run: func() {
+				if ui.running.Load() || ui.psiActive.Load() {
+					return
+				}
+				go ui.triggerPSIStart()
+			},
+		},
+		{
+			name: "PSI Stop",
+			desc: "PSI,0 — stop periodic push",
+			run: func() {
+				ui.stopPSI()
 			},
 		},
 	}
@@ -304,7 +379,11 @@ func (ui *TUI) sendCommand(cmd string) {
 	defer ui.mu.Unlock()
 
 	ui.logf("[yellow]> %s[-]\n", tview.Escape(cmd))
-	response, err := Execute(ui.scanner, RawCommand{cmd: cmd})
+	if err := ui.scanner.Send(cmd); err != nil {
+		ui.logf("[red]Error: %v[-]\n", err)
+		return
+	}
+	response, err := ui.scanner.ReadAll()
 	if err != nil {
 		ui.logf("[red]Error: %v[-]\n", err)
 		return
@@ -321,7 +400,11 @@ func (ui *TUI) executeCommand(cmd string) {
 	defer ui.mu.Unlock()
 
 	ui.logf("[yellow]> %s[-]\n", tview.Escape(cmd))
-	response, err := Execute(ui.scanner, RawCommand{cmd: cmd})
+	if err := ui.scanner.Send(cmd); err != nil {
+		ui.logf("[red]Error: %v[-]\n", err)
+		return
+	}
+	response, err := ui.scanner.ReadAll()
 	if err != nil {
 		ui.logf("[red]Error: %v[-]\n", err)
 		return
@@ -408,6 +491,163 @@ func (ui *TUI) runFunction(fn Function, values map[string]string) {
 		ui.sendCommand(cmd)
 	}
 	ui.logf("[green]▶ done[-]\n\n")
+}
+
+func (ui *TUI) triggerPSIStart() {
+	type psiResult struct {
+		interval int
+		ok       bool
+	}
+	done := make(chan psiResult, 1)
+
+	ui.app.QueueUpdateDraw(func() {
+		form := tview.NewForm()
+		form.AddInputField("Interval (ms): ", "300", 10, nil, nil)
+
+		submit := func() {
+			field, _ := form.GetFormItem(0).(*tview.InputField)
+			val := 300
+			fmt.Sscanf(field.GetText(), "%d", &val)
+			select {
+			case done <- psiResult{val, true}:
+			default:
+			}
+			ui.pages.RemovePage("modal")
+			ui.app.SetFocus(ui.input)
+		}
+		cancel := func() {
+			select {
+			case done <- psiResult{ok: false}:
+			default:
+			}
+			ui.pages.RemovePage("modal")
+			ui.app.SetFocus(ui.input)
+		}
+
+		form.AddButton("Start", submit)
+		form.AddButton("Cancel", cancel)
+		form.SetBorder(true).SetTitle(" PSI Interval ")
+		form.SetCancelFunc(cancel)
+
+		modal := tview.NewFlex().
+			AddItem(nil, 0, 1, false).
+			AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+				AddItem(nil, 0, 1, false).
+				AddItem(form, 10, 0, true).
+				AddItem(nil, 0, 1, false), 38, 0, true).
+			AddItem(nil, 0, 1, false)
+
+		ui.pages.AddPage("modal", modal, true, true)
+		ui.app.SetFocus(form)
+	})
+
+	result := <-done
+	if !result.ok {
+		return
+	}
+	ui.startPSI(result.interval)
+}
+
+func (ui *TUI) startPSI(interval int) {
+	ui.psiMu.Lock()
+	defer ui.psiMu.Unlock()
+
+	if ui.psiCancel != nil {
+		ui.psiCancel()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ui.psiCancel = cancel
+	ui.psiInterval.Store(int32(interval))
+	ui.psiActive.Store(true)
+
+	go ui.psiLoop(ctx, interval)
+}
+
+func (ui *TUI) stopPSI() {
+	ui.psiMu.Lock()
+	defer ui.psiMu.Unlock()
+
+	if ui.psiCancel == nil {
+		return
+	}
+	ui.psiCancel()
+	ui.psiCancel = nil
+}
+
+func (ui *TUI) psiLoop(ctx context.Context, interval int) {
+	defer func() {
+		ui.psiActive.Store(false)
+		ui.app.QueueUpdateDraw(func() {
+			ui.infoPanel.SetTitle(" Scanner Info ")
+		})
+		ui.logf("[::d]PSI stopped[-]\n")
+	}()
+
+	send := func() bool {
+		ui.mu.Lock()
+		defer ui.mu.Unlock()
+		err := ui.scanner.Send(fmt.Sprintf("PSI,%d", interval))
+		if err != nil {
+			ui.logf("[red]PSI send error: %v[-]\n", err)
+			return false
+		}
+		return true
+	}
+
+	if !send() {
+		return
+	}
+	ui.logf("[yellow]> PSI,%d[-]\n[green]PSI active[-]\n", interval)
+	ui.app.QueueUpdateDraw(func() {
+		ui.infoPanel.SetTitle(fmt.Sprintf(" Scanner Info [PSI:%dms] ", interval))
+	})
+
+	lastSent := time.Now()
+
+	for {
+		// Auto-restart before 2-min timeout.
+		if time.Since(lastSent) > 110*time.Second {
+			if !send() {
+				return
+			}
+			lastSent = time.Now()
+			ui.logf("[::d]PSI refreshed[-]\n")
+		}
+
+		// Read one push. ReadAll blocks until 100ms silence so it
+		// naturally waits for a complete XML document before returning.
+		ui.mu.Lock()
+		data, err := ui.scanner.ReadAll()
+		ui.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			ui.mu.Lock()
+			_ = ui.scanner.Send("PSI,0")
+			ui.mu.Unlock()
+			return
+		default:
+		}
+
+		if err != nil || data == "" {
+			continue
+		}
+
+		info, err := (GSICommand{}).Parse(data)
+		if err != nil {
+			continue
+		}
+
+		rendered := renderGSIPanel(info)
+		ui.app.QueueUpdateDraw(func() {
+			row, col := ui.infoPanel.GetScrollOffset()
+			ui.infoPanel.Clear()
+			fmt.Fprint(ui.infoPanel, rendered)
+			ui.infoPanel.ScrollTo(row, col)
+			ui.infoPanel.SetTitle(fmt.Sprintf(" Scanner Info [PSI:%dms] ", interval))
+		})
+	}
 }
 
 func (ui *TUI) startFileWatcher() {
