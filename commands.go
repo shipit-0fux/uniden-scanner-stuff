@@ -23,8 +23,6 @@ func Execute[R any](s *Scanner, cmd Command[R]) (R, error) {
 
 func zero[R any]() R { var z R; return z }
 
-// ── Commands ──────────────────────────────────────────────────────────────────
-
 type MDLResponse struct{ Model string }
 
 type MDLCommand struct{}
@@ -50,8 +48,6 @@ func (c VERCommand) Parse(response string) (VERResponse, error) {
 	}
 	return VERResponse{Version: parts[1]}, nil
 }
-
-// ── Keys ──────────────────────────────────────────────────────────────────────
 
 type Key string
 

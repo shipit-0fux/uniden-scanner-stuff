@@ -1,0 +1,59 @@
+[
+  {
+    "name": "Squelch Test (up 1, down 2)",
+    "commands": [
+      "KEY,F,P",
+      "KEY,^,P",
+      "KEY,>,P",
+      "KEY,<,P",
+      "KEY,<,P",
+      "KEY,^,P"
+    ]
+  },
+  {
+    "name": "Get Version",
+    "commands": [
+      "VER"
+    ]
+  },
+  {
+    "name": "Full Status",
+    "commands": [
+      "VER",
+      "MDL",
+      "STS"
+    ]
+  },
+  {
+    "name": "Scan Range",
+    "commands": [
+      "SCN,{start},{end}"
+    ]
+  },
+  {
+  "name": "GSI - Get System Status",
+  "commands": ["GSI"]
+  },
+  {
+    "name": "Toggle Full DB",
+    "commands": [
+      "MNU",
+      "MSV,,0",
+      "MSV,,2",
+      "KEY,E,P",
+      "JPM,SCN_MODE"
+    ]
+  },
+  {
+    "name": "Toggle Light",
+    "commands": [
+      "KEY,V,P"
+    ]
+},
+  {
+    "name": "Scan Mode",
+    "commands": [
+      "JPM,SCAN_MODE"
+    ]
+  }
+]

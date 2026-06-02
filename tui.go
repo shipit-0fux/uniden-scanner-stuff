@@ -21,6 +21,7 @@ type TUI struct {
 	layout   tview.Primitive
 	console  *tview.TextView
 	input    *tview.InputField
+	cmdList  *tview.List
 	funcList *tview.List
 	pages    *tview.Pages
 }
@@ -59,18 +60,26 @@ func (ui *TUI) build(functions []Function) {
 		go ui.executeCommand(cmd)
 	})
 
+	ui.cmdList = tview.NewList().ShowSecondaryText(true)
+	ui.cmdList.SetBorder(true).SetTitle(" Commands ")
+	ui.cmdList.SetSelectedStyle(tcell.StyleDefault.Background(tcell.ColorDarkBlue).Foreground(tcell.ColorWhite))
+	ui.populateCmdList()
+
 	ui.funcList = tview.NewList().ShowSecondaryText(true)
 	ui.funcList.SetBorder(true).SetTitle(fmt.Sprintf(" Functions (%s) ", ui.funcFile))
 	ui.funcList.SetSelectedStyle(tcell.StyleDefault.Background(tcell.ColorDarkBlue).Foreground(tcell.ColorWhite))
-
 	ui.populateFuncList(functions)
+
+	leftPanel := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(ui.cmdList, 0, 1, false).
+		AddItem(ui.funcList, 0, 1, false)
 
 	rightPanel := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(ui.console, 0, 1, false).
 		AddItem(ui.input, 3, 0, true)
 
 	mainFlex := tview.NewFlex().
-		AddItem(ui.funcList, 36, 0, false).
+		AddItem(leftPanel, 36, 0, false).
 		AddItem(rightPanel, 0, 1, true)
 
 	ui.pages = tview.NewPages().AddPage("main", mainFlex, true, true)
@@ -79,10 +88,13 @@ func (ui *TUI) build(functions []Function) {
 	ui.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyTab:
-			if ui.funcList.HasFocus() {
-				ui.app.SetFocus(ui.input)
-			} else {
+			switch {
+			case ui.cmdList.HasFocus():
 				ui.app.SetFocus(ui.funcList)
+			case ui.funcList.HasFocus():
+				ui.app.SetFocus(ui.input)
+			default:
+				ui.app.SetFocus(ui.cmdList)
 			}
 			return nil
 		case tcell.KeyEscape:
@@ -96,6 +108,146 @@ func (ui *TUI) build(functions []Function) {
 
 	_, _ = fmt.Fprint(ui.console, "[::d]Connected to serial port at 115200 baud[-]\n")
 	_, _ = fmt.Fprint(ui.console, "[::d]Tab: switch focus | Enter: send/execute | Ctrl+C: quit[-]\n\n")
+}
+
+func (ui *TUI) populateCmdList() {
+	type entry struct {
+		name string
+		desc string
+		run  func()
+	}
+
+	builtins := []entry{
+		{
+			name: "VERCommand",
+			desc: "VER — get firmware version",
+			run: func() {
+				if ui.running.Load() {
+					return
+				}
+				go func() {
+					ui.setBlocked(true)
+					defer ui.setBlocked(false)
+					ui.mu.Lock()
+					defer ui.mu.Unlock()
+					ui.logf("[yellow]> VER[-]\n")
+					r, err := Execute(ui.scanner, VERCommand{})
+					if err != nil {
+						ui.logf("[red]Error: %v[-]\n", err)
+						return
+					}
+					ui.logf("Version: %s\n", tview.Escape(r.Version))
+				}()
+			},
+		},
+		{
+			name: "MDLCommand",
+			desc: "MDL — get model info",
+			run: func() {
+				if ui.running.Load() {
+					return
+				}
+				go func() {
+					ui.setBlocked(true)
+					defer ui.setBlocked(false)
+					ui.mu.Lock()
+					defer ui.mu.Unlock()
+					ui.logf("[yellow]> MDL[-]\n")
+					r, err := Execute(ui.scanner, MDLCommand{})
+					if err != nil {
+						ui.logf("[red]Error: %v[-]\n", err)
+						return
+					}
+					ui.logf("Model: %s\n", tview.Escape(r.Model))
+				}()
+			},
+		},
+		{
+			name: "KEYCommand",
+			desc: "KEY,{key},{mode} — send keypress",
+			run: func() {
+				if ui.running.Load() {
+					return
+				}
+				go ui.triggerKEYCommand()
+			},
+		},
+	}
+
+	for _, b := range builtins {
+		ui.cmdList.AddItem(b.name, b.desc, 0, b.run)
+	}
+}
+
+type keyResult struct {
+	key  string
+	mode string
+	ok   bool
+}
+
+func (ui *TUI) triggerKEYCommand() {
+	done := make(chan keyResult, 1)
+
+	ui.app.QueueUpdateDraw(func() {
+		form := tview.NewForm()
+		form.AddInputField("Key: ", "", 10, nil, nil)
+		form.AddInputField("Mode (P/H/R): ", "P", 10, nil, nil)
+
+		send := func() {
+			keyField, _ := form.GetFormItem(0).(*tview.InputField)
+			modeField, _ := form.GetFormItem(1).(*tview.InputField)
+			select {
+			case done <- keyResult{keyField.GetText(), modeField.GetText(), true}:
+			default:
+			}
+			ui.pages.RemovePage("modal")
+			ui.app.SetFocus(ui.input)
+		}
+		cancel := func() {
+			select {
+			case done <- keyResult{ok: false}:
+			default:
+			}
+			ui.pages.RemovePage("modal")
+			ui.app.SetFocus(ui.input)
+		}
+
+		form.AddButton("Send", send)
+		form.AddButton("Cancel", cancel)
+		form.SetBorder(true).SetTitle(" KEYCommand ")
+		form.SetCancelFunc(cancel)
+
+		modal := tview.NewFlex().
+			AddItem(nil, 0, 1, false).
+			AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+				AddItem(nil, 0, 1, false).
+				AddItem(form, 14, 0, true).
+				AddItem(nil, 0, 1, false), 44, 0, true).
+			AddItem(nil, 0, 1, false)
+
+		ui.pages.AddPage("modal", modal, true, true)
+		ui.app.SetFocus(form)
+	})
+
+	result := <-done
+	if !result.ok || result.key == "" {
+		return
+	}
+
+	ui.setBlocked(true)
+	defer ui.setBlocked(false)
+	ui.mu.Lock()
+	defer ui.mu.Unlock()
+
+	k := Key(strings.ToUpper(result.key))
+	m := KeyMode(strings.ToUpper(result.mode))
+	ui.logf("[yellow]> KEY,%s,%s[-]\n", k, m)
+	_, err := Execute(ui.scanner, KEYCommand{Key: k, Mode: m})
+	if err != nil {
+		ui.logf("[red]Error: %v[-]\n", err)
+		return
+	}
+	ui.logf("[green]KEY sent[-]\n")
 }
 
 func (ui *TUI) populateFuncList(functions []Function) {
